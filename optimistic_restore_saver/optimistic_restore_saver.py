@@ -1,0 +1,85 @@
+# Copyright 2018 Yannic Kilcher
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+import re
+
+from tensorflow.python.platform import tf_logging
+from tensorflow.python.framework import ops
+from tensorflow.python.ops import io_ops
+from tensorflow.python.training.checkpoint_utils import load_checkpoint
+from tensorflow.python.training.saver import Saver
+from tensorflow.python.training.saver import BaseSaverBuilder
+from tensorflow.python.eager import context
+
+
+__all__ = ['OptimisticRestoreSaver']
+
+
+class OptimisticRestoreSaver(Saver):
+    """Only restores variables in `var_list` that are present in the checkpoint on restore. However, on save, all variables in `var_list` are written to the checkpoint."""
+
+    def __init__(self, var_list=None, **kwargs):
+        kwargs['restore_sequentially'] = False
+        kwargs['builder'] = BaseSaverBuilder()
+        super().__init__(var_list=var_list, **kwargs)
+
+    def restore(self, sess, save_path, var_filter=lambda v: True):
+        """Restores only variables that are contained in `save_path` and match in shape and dtype and return `True` when passed to `var_filter`."""
+        if self._is_empty:
+            return
+        if save_path is None:
+            raise ValueError("Can't load save_path when it is None.")
+        tf_logging.info("Restoring parameters from %s", save_path)
+
+        reader = load_checkpoint(save_path)
+        shape_map = reader.get_variable_to_shape_map()
+        dtype_map = reader.get_variable_to_dtype_map()
+
+        restore_op_name = self.saver_def.restore_op_name
+        restore_op_grouped = sess.graph.get_operation_by_name(restore_op_name)
+
+        def get_restore_ops(r_op):
+            return sum((get_restore_ops(i) for i in r_op.control_inputs), [r_op] if r_op.type == 'Assign' else [])
+
+        all_restore_ops = get_restore_ops(restore_op_grouped)
+        filtered_restore_ops = []
+
+        for r_op in all_restore_ops:
+            v = r_op.inputs[0]
+            tensor_name = v.op.name
+            part_match = re.search(r'/part_\d+$', tensor_name)
+            if part_match:
+                tf_logging.info('variable %s is sharded', tensor_name)
+                tensor_name = tensor_name[:part_match.span()[0]]
+            tensor_shape = v.get_shape().as_list()
+            tensor_dtype = v.dtype.base_dtype
+            if tensor_name not in shape_map or tensor_name not in dtype_map:
+                tf_logging.warn('variable %s not in checkpoint', tensor_name)
+            elif shape_map[tensor_name] != tensor_shape and not part_match:
+                tf_logging.warn('variable %s in checkpoint, but checkpoint shape %r does not match graph shape %r', tensor_name, shape_map[tensor_name], tensor_shape)
+            elif dtype_map[tensor_name] != tensor_dtype:
+                tf_logging.warn('variable %s in checkpoint, but checkpoint dtype %r does not match graph dtype %r', tensor_name, dtype_map[tensor_name], tensor_dtype)
+            elif not var_filter(v):
+                tf_logging.info('variable %s rejected by var_filter', tensor_name, dtype_map[tensor_name], tensor_dtype)
+            else:
+                filtered_restore_ops.append(r_op)
+                tf_logging.info('adding variable %s to be restored', tensor_name)
+
+        if context.in_eager_mode():
+            raise NotImplementedError('eager selective restoring not supported yet')
+
+        for r_op in filtered_restore_ops:
+            sess.run(r_op, {self.saver_def.filename_tensor_name: save_path})
+
